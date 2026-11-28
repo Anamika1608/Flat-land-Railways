@@ -24,7 +24,7 @@ import numpy as np
 from flatland.envs.step_utils.states import TrainState
 
 from railsim.disruptions import DisruptionSpec
-from railsim.env_factory import EnvConfig, make_env
+from railsim.env_factory import EnvConfig, make_env, scenario_config
 from railsim.metrics import network_delay
 from railsim.planner import plan_all
 from railsim.policies import PlanningDispatcher, train_slack
@@ -256,8 +256,13 @@ class StrategyEnv(gym.Env):
     MIXED_DURATIONS = [10, 20, 30, 40]
     MIXED_COUNTS = [1, 2]
 
-    def __init__(self, seeds, num_trains=8, disruptions=DisruptionSpec(count=1, duration=20), mixed=False):
+    def __init__(self, seeds, num_trains=8, disruptions=DisruptionSpec(count=1, duration=20), mixed=False,
+                 scale="small", train_sizes=None):
+        """train_sizes: optional list; each episode then draws its number of
+        trains from it (large-scale training on 50 to 100 trains)."""
         super().__init__()
+        self.scale = scale
+        self.train_sizes = list(train_sizes) if train_sizes else None
         self.seeds = list(seeds)
         self.base_num_trains = num_trains
         self.base_disruptions = disruptions
@@ -282,7 +287,9 @@ class StrategyEnv(gym.Env):
             )
         else:
             self.num_trains, self.disruptions = self.base_num_trains, self.base_disruptions
-        self.env, _, _ = make_env(EnvConfig(num_trains=self.num_trains, seed=scenario), self.disruptions)
+            if self.train_sizes and not (options and options.get("fixed_conditions")):
+                self.num_trains = int(self.np_random.choice(self.train_sizes))
+        self.env, _, _ = make_env(scenario_config(self.num_trains, scenario, self.scale), self.disruptions)
         self.dispatcher = SelectingDispatcher()
         self.dispatcher.reset(self.env)
         self.done = False

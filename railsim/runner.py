@@ -45,17 +45,19 @@ def _run(config, policy, disruptions):
     return env, delay_curve, stats
 
 
-def run_episode(config: EnvConfig, policy_class, disruptions: DisruptionSpec = None):
+def run_episode(config: EnvConfig, policy_class, disruptions: DisruptionSpec = None, reference=True):
     """
     Run `policy_class` on the scenario defined by `config` and `disruptions`.
 
     If there are disruptions, the same scenario is also run without them
     (same policy) to measure recovery time against an undisrupted baseline.
+    reference=False skips that second run (extra delay and recovery time
+    are then not measured).
     """
     env, curve, stats = _run(config, policy_class(), disruptions)
 
     reference_curve = None
-    if disruptions is not None and env.disruption_plan:
+    if reference and disruptions is not None and env.disruption_plan:
         _, reference_curve, _ = _run(config, policy_class(), None)
 
     delays = [train_delay(agent, env) for agent in env.agents]

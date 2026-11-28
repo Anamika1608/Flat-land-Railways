@@ -14,7 +14,11 @@ import torch
 from torch import nn
 from torch.distributions import Categorical
 from flatland.envs.step_utils.states import TrainState
+from railsim.metrics import network_delay
+from railsim.policies import train_slack
 from railsim.rl_dispatch import OBS_SIZE, ReleaseDispatcher, observation
+
+SUMMARY_SIZE = 10   # network summary features of summary_state (below)
 
 
 class Actor(nn.Module):
@@ -62,6 +66,40 @@ def joint_state(dispatch_env):
     return np.concatenate([np.asarray(rows, dtype=np.float32).reshape(-1), active])
 
 
+def summary_state(dispatch_env, own_obs):
+    """
+    Fixed-size critic input for any number of trains: the deciding train's
+    observation plus a summary of the whole network. joint_state needs every
+    train's observation (one route search per train per decision), which is
+    too slow for 100 trains; this summary costs no route search.
+
+    Summary (all scaled to about -1..1): time used, shares of trains on the
+    track / arrived / not departed / broken down / waiting for a decision,
+    mean and minimum slack of unfinished trains, share of unfinished trains
+    with negative slack, and the current network delay per train.
+    """
+    env = dispatch_env.env
+    now = env._elapsed_steps
+    n = len(env.agents)
+    T = max(1, env._max_episode_steps)
+    agents = env.agents
+    unfinished = [a.handle for a in agents if a.state != TrainState.DONE]
+    slacks = [train_slack(env, h, now) / T for h in unfinished] or [0.0]
+    summary = np.array([
+        now / T,
+        sum(a.state.is_on_map_state() for a in agents) / n,
+        sum(a.state == TrainState.DONE for a in agents) / n,
+        sum(a.state.is_off_map_state() for a in agents) / n,
+        sum(a.malfunction_handler.malfunction_down_counter > 0 for a in agents) / n,
+        len(dispatch_env.queue) / n,
+        float(np.mean(slacks)),
+        float(np.min(slacks)),
+        sum(s < 0 for s in slacks) / max(1, len(unfinished)),
+        network_delay(env) / (n * T),
+    ], dtype=np.float32)
+    return np.concatenate([np.asarray(own_obs, dtype=np.float32), np.clip(summary, -1.0, 1.0)])
+
+
 def generalized_advantage(rewards, values, dones, gamma=1.0, gae_lambda=0.95):
     """GAE computed over the sequential per-train decisions in one episode."""
     advantages = np.zeros(len(rewards), dtype=np.float32)
@@ -79,10 +117,14 @@ def generalized_advantage(rewards, values, dones, gamma=1.0, gae_lambda=0.95):
 class MAPPO:
     """Shared-actor MAPPO learner with a centralized training critic."""
     def __init__(self, num_trains, hidden_size=64, learning_rate=3e-4,
-                 clip_range=0.2, entropy_coef=0.01, value_coef=0.5, device="cpu"):
+                 clip_range=0.2, entropy_coef=0.01, value_coef=0.5, device="cpu", critic="joint"):
+        """critic: "joint" (all train observations, fixed number of trains) or
+        "summary" (deciding train + network summary, any number of trains)."""
         self.num_trains = int(num_trains)
         self.obs_size = OBS_SIZE
-        self.state_size = self.num_trains * (OBS_SIZE + 1)
+        self.critic_kind = critic
+        self.state_size = (self.num_trains * (OBS_SIZE + 1) if critic == "joint"
+                           else OBS_SIZE + SUMMARY_SIZE)
         self.device = torch.device(device)
         self.actor = Actor(OBS_SIZE, hidden_size).to(self.device)
         self.critic = CentralizedCritic(self.state_size, hidden_size).to(self.device)
@@ -153,13 +195,20 @@ class MAPPO:
             "num_trains": self.num_trains,
             "obs_size": self.obs_size,
             "state_size": self.state_size,
+            "critic_kind": self.critic_kind,
         }, path)
+
+    def state(self, dispatch_env, own_obs):
+        """Critic input for the current decision."""
+        if self.critic_kind == "joint":
+            return joint_state(dispatch_env)
+        return summary_state(dispatch_env, own_obs)
 
     @classmethod
     def load_actor(cls, path, num_trains=None, device="cpu"):
         checkpoint = torch.load(path, map_location=device)
         n = int(num_trains or checkpoint["num_trains"])
-        model = cls(n, device=device)
+        model = cls(n, device=device, critic=checkpoint.get("critic_kind", "joint"))
         model.actor.load_state_dict(checkpoint["actor"])
         model.actor.eval()
         return model.actor

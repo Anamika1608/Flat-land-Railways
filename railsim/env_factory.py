@@ -32,6 +32,19 @@ class EnvConfig:
     max_rail_pairs_in_city: int = 2
 
 
+# Named map sizes. "small" is the network of the original study (8 to 24
+# trains); "large" is a bigger network for 100 trains.
+SCALES = {
+    "small": {"width": 30, "height": 30, "max_cities": 3},
+    "large": {"width": 50, "height": 50, "max_cities": 8},
+}
+
+
+def scenario_config(num_trains, seed, scale="small"):
+    """EnvConfig for `num_trains` trains on the named map size."""
+    return EnvConfig(num_trains=num_trains, seed=seed, **SCALES[scale])
+
+
 # Flatland warnings that mean the requested city layout could not be built
 # and a different network was generated instead.
 _LAYOUT_WARNINGS = ("could not set all required cities", "changing to grid mode")

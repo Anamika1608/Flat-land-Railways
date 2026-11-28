@@ -30,7 +30,7 @@ import numpy as np
 from flatland.envs.step_utils.states import TrainState
 
 from railsim.disruptions import DisruptionSpec
-from railsim.env_factory import EnvConfig, make_env
+from railsim.env_factory import EnvConfig, make_env, scenario_config
 from railsim.metrics import network_delay
 from railsim.planner import OFF_MAP, bookings_for, plan_route
 from railsim.policies import PlanningDispatcher, train_slack
@@ -243,8 +243,9 @@ class DispatchEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, seeds, num_trains=8, disruptions=DisruptionSpec(count=1, duration=20)):
+    def __init__(self, seeds, num_trains=8, disruptions=DisruptionSpec(count=1, duration=20), scale="small"):
         super().__init__()
+        self.scale = scale
         self.seeds = list(seeds)
         self.num_trains = num_trains
         self.disruptions = disruptions
@@ -257,7 +258,7 @@ class DispatchEnv(gym.Env):
         if options and "scenario" in options:
             scenario = int(options["scenario"])
         self.scenario = scenario
-        self.env, _, _ = make_env(EnvConfig(num_trains=self.num_trains, seed=scenario), self.disruptions)
+        self.env, _, _ = make_env(scenario_config(self.num_trains, scenario, self.scale), self.disruptions)
         self.dispatcher = _ExternalDecisions()
         self.dispatcher.reset(self.env)
         self.queue = []

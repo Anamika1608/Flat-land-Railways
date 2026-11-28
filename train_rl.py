@@ -38,13 +38,15 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from railsim.disruptions import DisruptionSpec
-from railsim.env_factory import EnvConfig
+from railsim.env_factory import EnvConfig, SCALES, scenario_config
 from railsim.env_factory import usable_seeds
 from railsim.rl_dispatch import DispatchEnv, hold_if_blocked_action
 from railsim.strategy import NAMES, StrategyEnv, greedy_action
 
 TRAIN_TRAINS = 8
 TRAIN_DISRUPTIONS = DisruptionSpec(count=1, duration=20)
+SCALE = "small"   # map size (railsim.env_factory.SCALES); set by --scale
+TRAIN_SIZES = None   # optional train counts drawn per training episode; set by --train-sizes
 TRAIN_SEED_START = 1000
 VALIDATION_SEED_START = 5000
 
@@ -88,7 +90,7 @@ TASKS = {
 
 def validation_score(model, seeds, env_class):
     """Mean final total delay over `seeds` (lower is better), plus arrivals."""
-    env = env_class(seeds, TRAIN_TRAINS, TRAIN_DISRUPTIONS)
+    env = env_class(seeds, TRAIN_TRAINS, TRAIN_DISRUPTIONS, scale=SCALE)
     delays, arrived = [], []
     for scenario in seeds:
         obs, _ = env.reset(options={"scenario": scenario})
@@ -123,7 +125,8 @@ def warm_start(model, seeds, task, target=0.9, max_updates=2000):
 
     gamma = task["ppo"]["gamma"]
     teacher_action = task["teacher"]
-    env = task["env"](seeds, TRAIN_TRAINS, TRAIN_DISRUPTIONS, **task.get("env_kwargs", {}))
+    sizes = {"train_sizes": TRAIN_SIZES} if TRAIN_SIZES else {}
+    env = task["env"](seeds, TRAIN_TRAINS, TRAIN_DISRUPTIONS, scale=SCALE, **sizes, **task.get("env_kwargs", {}))
     states, actions, returns = [], [], []
     for scenario in seeds:
         obs, _ = env.reset(options={"scenario": scenario})
@@ -231,16 +234,27 @@ def main():
     parser.add_argument("--train-scenarios", type=int, default=300)
     parser.add_argument("--val-scenarios", type=int, default=30)
     parser.add_argument("--eval-every", type=int, help="decisions between validation checks")
+    parser.add_argument("--trains", type=int, default=8, help="trains per training scenario")
+    parser.add_argument("--scale", choices=list(SCALES), default="small", help="map size")
+    parser.add_argument("--warm-start-scenarios", type=int, help="scenarios used to imitate the starting rule")
+    parser.add_argument("--suffix", default="", help="added to the model name, e.g. _large")
+    parser.add_argument("--train-sizes", type=int, nargs="+",
+                        help="draw the number of trains per training episode from these values "
+                             "(validation stays on --trains)")
     args = parser.parse_args()
-    task = TASKS[args.task]
+    task = dict(TASKS[args.task])
+    if args.warm_start_scenarios:
+        task["warm_start_scenarios"] = args.warm_start_scenarios
+    global TRAIN_TRAINS, SCALE, TRAIN_SIZES
+    TRAIN_TRAINS, SCALE, TRAIN_SIZES = args.trains, args.scale, args.train_sizes
 
-    base = EnvConfig(num_trains=TRAIN_TRAINS)
+    base = scenario_config(TRAIN_TRAINS, 0, SCALE)
     train_seeds = usable_seeds(base, args.train_scenarios, start=TRAIN_SEED_START)
     val_seeds = usable_seeds(base, args.val_scenarios, start=VALIDATION_SEED_START)
     assert max(train_seeds) < VALIDATION_SEED_START, "training and validation seeds overlap"
 
     os.makedirs("models", exist_ok=True)
-    path = f"models/{task['prefix']}_seed{args.seed}"
+    path = f"models/{task['prefix']}{args.suffix}_seed{args.seed}"
     print(f"Task: {args.task}")
     print(f"Training scenarios: {len(train_seeds)} (seeds {train_seeds[0]}..{train_seeds[-1]})")
     print(f"Validation scenarios: {len(val_seeds)} (seeds {val_seeds[0]}..{val_seeds[-1]})")
@@ -249,18 +263,21 @@ def main():
               f"{StrategyEnv.MIXED_DURATIONS}, breakdowns {StrategyEnv.MIXED_COUNTS}; "
               f"validation on {TRAIN_TRAINS} trains, {TRAIN_DISRUPTIONS}", flush=True)
     else:
-        print(f"Conditions: {TRAIN_TRAINS} trains, {TRAIN_DISRUPTIONS}", flush=True)
+        print(f"Conditions: {TRAIN_TRAINS} trains, {TRAIN_DISRUPTIONS}, map {SCALE} {SCALES[SCALE]}", flush=True)
 
     vec_env = make_vec_env(
         task["env"], n_envs=args.envs, seed=args.seed, vec_env_cls=SubprocVecEnv,
-        env_kwargs={"seeds": train_seeds, "num_trains": TRAIN_TRAINS, "disruptions": TRAIN_DISRUPTIONS,
+        env_kwargs={"seeds": train_seeds, "num_trains": TRAIN_TRAINS, "disruptions": TRAIN_DISRUPTIONS, "scale": SCALE,
+                    **({"train_sizes": args.train_sizes} if args.train_sizes else {}),
                     **task.get("env_kwargs", {})},
     )
     model = PPO(
         "MlpPolicy", vec_env, seed=args.seed, device="cpu", verbose=0,
         policy_kwargs={"net_arch": [64, 64]}, **task["ppo"],
     )
+    model.save(path + "_untrained.zip")      # random policy, before any training
     warm_start(model, train_seeds[:task["warm_start_scenarios"]], task)
+    model.save(path + "_imitation.zip")      # after imitating the starting rule, before PPO
     callback = KeepBest(val_seeds, args.eval_every or task["eval_every"],
                         path + ".zip", path + "_log.csv", task["env"])
     model.learn(total_timesteps=args.timesteps or task["timesteps"], callback=callback)

@@ -70,13 +70,20 @@ class Bookings:
 
 
 def _next_moves(env, configuration):
-    """{next configuration: action} for every legal move from `configuration`."""
+    """{next configuration: action} for every legal move from `configuration`.
+    The track never changes during an episode, so results are cached per
+    environment (same values, computed once)."""
+    cache = env.__dict__.setdefault("_railsim_moves", {})
+    moves = cache.get(configuration)
+    if moves is not None:
+        return moves
     moves = {}
     for action in MOVE_ACTIONS:
         result = env.rail.apply_action_independent(action, configuration)
         if result is not None:
             next_configuration, _ = result
             moves.setdefault(next_configuration, action)
+    cache[configuration] = moves
     return moves
 
 
@@ -120,6 +127,17 @@ def plan_route(env, agent, now, bookings, horizon):
     if estimate(start) == float("inf"):
         return None
 
+    # Fast local version of bookings.free_for (same logic, fewer calls).
+    at_get, from_get = bookings._at.get, bookings._from.get
+
+    def free(cell, t):
+        holder = at_get((cell, t))
+        if holder is None:
+            held = from_get(cell)
+            if held is not None and t >= held[1]:
+                holder = held[0]
+        return holder is None or holder == handle
+
     tie = itertools.count()
     queue = [(now + estimate(start), next(tie), now, start)]
     came_from = {(now, start): None}
@@ -137,7 +155,7 @@ def plan_route(env, agent, now, bookings, horizon):
         # Wait where we are.
         if configuration is OFF_MAP:
             options.append((OFF_MAP, RailEnvActions.STOP_MOVING, False))
-        elif bookings.free_for(configuration[0], step, handle):
+        elif free(configuration[0], step):
             options.append((configuration, RailEnvActions.STOP_MOVING, False))
 
         # Move (or depart), if allowed by malfunction / timetable.
@@ -148,17 +166,20 @@ def plan_route(env, agent, now, bookings, horizon):
                 moves = _next_moves(env, configuration)
             for next_configuration, action in moves.items():
                 cell = next_configuration[0]
-                if bookings.free_for(cell, t, handle) and bookings.free_for(cell, step, handle):
+                if free(cell, t) and free(cell, step):
                     options.append((next_configuration, action, cell == target))
 
         for next_configuration, action, arrived in options:
             key = (step, ARRIVED if arrived else next_configuration)
             if key in came_from:
                 continue
-            came_from[key] = ((t, configuration), action, next_configuration)
             remaining = 0 if arrived else estimate(next_configuration)
-            if remaining == float("inf"):
+            if step + remaining > horizon:
+                # Cannot arrive by the horizon from here (the distance is a
+                # lower bound on the remaining time), so never on a route
+                # this search can return.
                 continue
+            came_from[key] = ((t, configuration), action, next_configuration)
             heapq.heappush(queue, (step + remaining, next(tie), key[0], key[1]))
 
     return None
